@@ -3,40 +3,21 @@ use anyhow::{anyhow, Context};
 use rand::prelude::*;
 use reqwest::StatusCode;
 use reqwest::{self, Client};
-use rust_decimal::prelude::*;
+//use rust_decimal::prelude::*;
+use sqlx::types::Decimal;
+use num_traits::cast::ToPrimitive;
 use scraper::{Html, Selector};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgConnection};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
-use sqlx::{ConnectOptions, Connection};
-use std::sync::Mutex;
+use sqlx::postgres::{PgConnectOptions, PgConnection};
+//use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, Sqlite};
+use sqlx::ConnectOptions;
+use tokio::sync::Mutex;
 use once_cell::sync::OnceCell;
-
-use lazy_static::lazy_static;
+use std::str::FromStr;
 
 const BASE_URL: &str = "https://www.fashionnova.com";
 const URL_MEN_MENU: &str = "https://www.fashionnova.com/pages/men";
 
-/*
-lazy_static! {
-    static ref database: PgConnection = { 
-        tokio::runtime::Runtime::new().unwrap().block_on(
-            async {
-                PgConnectOptions::new()
-                    .host("localhost")
-                    .port(5432)
-                    .database("webstoredb")
-                    .username("postgres")
-                    .password("admin")
-                    .connect()
-                    .await
-                    .unwrap()
-            }
-        )
-     };
-} */
-
-
-// static DATABASE: OnceCell<Mutex<SqliteConnection>> = OnceCell::new();
+//static DATABASE: OnceCell<Mutex<SqliteConnection>> = OnceCell::new();
 static DATABASE: OnceCell<Mutex<PgConnection>> = OnceCell::new();
 
 async fn get_bs(url: &str) -> Result<Html> {
@@ -119,7 +100,7 @@ fn parse_price_1(bs: &Html) -> Result<Decimal> {
     price_li += 1;
     let price = &price_string[price_li..price_ri];
 
-    let price = match Decimal::from_str(price) {
+    let price = match Decimal::from_str_exact(price) {
         Ok(price) => price,
         Err(_) => {
             println!("invalid_price");
@@ -132,43 +113,52 @@ fn parse_price_1(bs: &Html) -> Result<Decimal> {
 
 async fn parse_product(link: &str, category: &str) -> Result<()> {
     let url = BASE_URL.to_owned() + link;
-    let bs = get_bs(&url).await?;
+    let (name, price, description, img, left) =  {
+        let bs = { get_bs(&url).await? };
 
-    // find("h1", class_="product-info__title")
-    let selector = &Selector::parse("h1.product-info__title").unwrap();
-    let name_element = bs.select(selector).next().context("No name")?;
-    let name = name_element.text().collect::<String>().trim().to_string();
+        // find("h1", class_="product-info__title")
+        let selector = &Selector::parse("h1.product-info__title").unwrap();
+        let name = {
+            let name_element = bs.select(selector).next().context("No name")?;
+            name_element.text().collect::<String>().trim().to_string()
+        };
 
+        // .select_one("div.product-info__details-body > ul")
+        let price = {
+            let mut price = parse_price_1(&bs);
+            if price.is_err() {
+                let selector = &Selector::parse("span.price").unwrap();
+                let price_element = bs.select(selector).next().unwrap();
+                let price_text = price_element.text().collect::<String>().trim().to_string();
+                price = Ok(Decimal::from_str(&price_text)?);
+            }
+            price.context("Bad price")?
+        };
 
-    // .select_one("div.product-info__details-body > ul")
-    let selector = &Selector::parse("div.product-info__details-body > ul").unwrap();
-    let description_element = bs.select(selector).next().context("No descr")?;
+        let description = {
+            let selector = &Selector::parse("div.product-info__details-body > ul").unwrap();
+            let description_element = bs.select(selector).next().context("No descr")?;
+            description_element
+                .text()
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
 
-    let mut price = parse_price_1(&bs);
-    if price.is_err() {
-        let selector = &Selector::parse("span.price").unwrap();
-        let price_element = bs.select(selector).next().unwrap();
-        let price_text = price_element.text().collect::<String>().trim().to_string();
-        price = Ok(Decimal::from_str(&price_text)?);
-    }
-    let price = price.context("Bad price")?;
+        //find("button", class_="product-slideshow__syte-button syte-discovery-modal")
+        let img = {
+            let selector =
+                &Selector::parse("button.product-slideshow__syte-button.syte-discovery-modal").unwrap();
+            let image_element = bs.select(selector).next().unwrap();
+            image_element.value().attr("data-image-src").unwrap().to_owned()
+        };
 
+        let mut rand = thread_rng();
+        let left = rand.gen_range(0..20);
 
-    let description = description_element
-        .text()
-        .collect::<String>()
-        .trim()
-        .to_string();
+        (name, price, description, img, left)
+    };
 
-    //find("button", class_="product-slideshow__syte-button syte-discovery-modal")
-    let selector =
-        &Selector::parse("button.product-slideshow__syte-button.syte-discovery-modal").unwrap();
-    let image_element = bs.select(selector).next().unwrap();
-    let img = image_element.value().attr("data-image-src").unwrap();
-
-
-    let mut rand = thread_rng();
-    let left = rand.gen_range(0..20);
 
     println!("name:{name}\ndesc:{description}\ncategory:{category}\nprice:{price:?}\nleft:{left}\nimg:{img}");
 
@@ -178,18 +168,20 @@ async fn parse_product(link: &str, category: &str) -> Result<()> {
     
     // VALUES ($0, $1, $2, $3, $4, $5)
     // VALUES (?, ?, ?, ?, ?, ?)
-    let price: f32 = price.to_f32().unwrap();
-    let mut db = DATABASE.get().unwrap().lock().unwrap();
+    //let price: f32 = price.to_f32().unwrap();
+
+    let mut transaction = DATABASE.get().unwrap().lock().await;
+
     sqlx::query!(
         "
-    INSERT INTO api_product (name, description, category, price, \"left\", img)
-    VALUES ($0, $1, $2, $3, $4, $5)
-    ", name, description, category, price, left, img
-    ).execute(&mut *db).await;
+            INSERT INTO api_product (name, description, category, price, \"left\", img)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ", name, description, category, price, left, img
+    ).execute(&mut (*transaction)).await.unwrap();
     Ok(())
 }
 
-async fn parse_products(link: &str, category: &str) {
+async fn parse_products<'a>(link: &str, category: &str) {
     println!("Parsing {category}");
     let mut rand = thread_rng();
 
@@ -201,21 +193,25 @@ async fn parse_products(link: &str, category: &str) {
     let selector = &Selector::parse("div.product-tile__product-title > a").unwrap();
     let link_elements = bs.select(selector).take(number_of_products);
     // [el.attrs["href"] for el in link_elements]
-    let links: Vec<_> = link_elements
+    let links: Vec<String> = link_elements
         .map(|el| el.value().attr("href").unwrap().to_string())
         .collect();
 
+    let mut set = tokio::task::JoinSet::new();
     for link in links {
-        let result = parse_product(&link, category).await;
-        println!("{result:?}");
+        let category_clone = category.to_owned();
+        //parse_product(&link, &category_clone).await;
+        set.spawn(async move { parse_product(&link, &category_clone).await; });
+        //println!("{result:?}");
     }
+    while let Some(res) = set.join_next().await {}
 }
 
 #[tokio::main]
 async fn main() {
     /*let conn = SqliteConnectOptions::from_str("sqlite:/home/tpouhuk/Work/soup_test/database.sqlite")
         .unwrap()
-        .connect().await.unwrap(); */
+        .connect().await.unwrap();*/
 
     let conn = PgConnectOptions::new()
         .host("localhost")
@@ -233,10 +229,10 @@ async fn main() {
     let women_links = get_links(BASE_URL, 5, 17).await;
     let men_links = get_links(URL_MEN_MENU, 4, 11).await;
 
-    /*println!("Parsing Women's categories");
+    println!("Parsing Women's categories");
     for (link, category) in women_links {
         parse_products(&link, &format!("Women {category}")).await;
-    }*/
+    }
 
     println!("Parsing Men's categories");
     for (link, category) in men_links {
