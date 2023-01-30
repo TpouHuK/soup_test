@@ -4,15 +4,15 @@ use rand::prelude::*;
 use reqwest::StatusCode;
 use reqwest::{self, Client};
 //use rust_decimal::prelude::*;
-use sqlx::types::Decimal;
 use num_traits::cast::ToPrimitive;
 use scraper::{Html, Selector};
 use sqlx::postgres::{PgConnectOptions, PgConnection};
+use sqlx::types::Decimal;
 //use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, Sqlite};
-use sqlx::ConnectOptions;
-use tokio::sync::Mutex;
 use once_cell::sync::OnceCell;
+use sqlx::ConnectOptions;
 use std::str::FromStr;
+use tokio::sync::Mutex;
 
 const BASE_URL: &str = "https://www.fashionnova.com";
 const URL_MEN_MENU: &str = "https://www.fashionnova.com/pages/men";
@@ -71,15 +71,11 @@ fn parse_price_1(bs: &Html) -> Result<Decimal> {
     }
 
     let price_string = price_element.html();
-    
+
     println!("price_string {price_string:?}");
     println!("price_innerhtml {:?}", price_element.inner_html());
 
-    let price_string_collect = price_element
-        .text()
-        .collect::<String>()
-        .trim()
-        .to_string();
+    let price_string_collect = price_element.text().collect::<String>().trim().to_string();
     println!("price_string_collect: {:?}", price_string_collect);
     let mut price_li = price_string.find('$').context("Bad price")?;
 
@@ -113,7 +109,7 @@ fn parse_price_1(bs: &Html) -> Result<Decimal> {
 
 async fn parse_product(link: &str, category: &str) -> Result<()> {
     let url = BASE_URL.to_owned() + link;
-    let (name, price, description, img, left) =  {
+    let (name, price, description, img, left) = {
         let bs = { get_bs(&url).await? };
 
         // find("h1", class_="product-info__title")
@@ -148,9 +144,14 @@ async fn parse_product(link: &str, category: &str) -> Result<()> {
         //find("button", class_="product-slideshow__syte-button syte-discovery-modal")
         let img = {
             let selector =
-                &Selector::parse("button.product-slideshow__syte-button.syte-discovery-modal").unwrap();
+                &Selector::parse("button.product-slideshow__syte-button.syte-discovery-modal")
+                    .unwrap();
             let image_element = bs.select(selector).next().unwrap();
-            image_element.value().attr("data-image-src").unwrap().to_owned()
+            image_element
+                .value()
+                .attr("data-image-src")
+                .unwrap()
+                .to_owned()
         };
 
         let mut rand = thread_rng();
@@ -159,13 +160,12 @@ async fn parse_product(link: &str, category: &str) -> Result<()> {
         (name, price, description, img, left)
     };
 
-
     println!("name:{name}\ndesc:{description}\ncategory:{category}\nprice:{price:?}\nleft:{left}\nimg:{img}");
 
     //cur.execute("""INSERT INTO api_product (name, description, category, price, "left", img)
     //VALUES (%s, %s, %s, %s, %s, %s);""",
     //(name, description, category, price, left, img))
-    
+
     // VALUES ($0, $1, $2, $3, $4, $5)
     // VALUES (?, ?, ?, ?, ?, ?)
     //let price: f32 = price.to_f32().unwrap();
@@ -175,9 +175,18 @@ async fn parse_product(link: &str, category: &str) -> Result<()> {
     sqlx::query!(
         "
             INSERT INTO api_product (name, description, category, price, \"left\", img)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ", name, description, category, price, left, img
-    ).execute(&mut (*transaction)).await.unwrap();
+            VALUES ($1, $2, $3, $4, $5, $6)
+        ",
+        name,
+        description,
+        category,
+        price,
+        left,
+        img
+    )
+    .execute(&mut (*transaction))
+    .await
+    .unwrap();
     Ok(())
 }
 
@@ -201,7 +210,9 @@ async fn parse_products<'a>(link: &str, category: &str) {
     for link in links {
         let category_clone = category.to_owned();
         //parse_product(&link, &category_clone).await;
-        set.spawn(async move { parse_product(&link, &category_clone).await; });
+        set.spawn(async move {
+            parse_product(&link, &category_clone).await;
+        });
         //println!("{result:?}");
     }
     while let Some(res) = set.join_next().await {}
@@ -210,8 +221,8 @@ async fn parse_products<'a>(link: &str, category: &str) {
 #[tokio::main]
 async fn main() {
     /*let conn = SqliteConnectOptions::from_str("sqlite:/home/tpouhuk/Work/soup_test/database.sqlite")
-        .unwrap()
-        .connect().await.unwrap();*/
+    .unwrap()
+    .connect().await.unwrap();*/
 
     let conn = PgConnectOptions::new()
         .host("localhost")
